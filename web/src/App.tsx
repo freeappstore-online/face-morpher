@@ -1,6 +1,14 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { Shell } from "./components/Shell";
 
+// ── MediaPipe types (loaded via CDN) ──────────────────────────────────────
+declare global {
+  interface Window {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    MediaPipeFaceLandmarker: any;
+  }
+}
+
 type FunnyEffect =
   | "bigEyes"
   | "squish"
@@ -19,48 +27,102 @@ interface Effect {
 }
 
 const EFFECTS: Effect[] = [
-  { id: "bigEyes", label: "Big Eyes", emoji: "👀", description: "Enormous googly eyes" },
-  { id: "squish", label: "Squish", emoji: "🥞", description: "Squash your face flat" },
-  { id: "stretch", label: "Stretch", emoji: "🦒", description: "Stretch your face tall" },
-  { id: "wobble", label: "Wobble", emoji: "🌊", description: "Wavy face distortion" },
-  { id: "pixelate", label: "Pixelate", emoji: "👾", description: "8-bit pixel face" },
-  { id: "rainbow", label: "Rainbow", emoji: "🌈", description: "Rainbow colour overlay" },
-  { id: "alien", label: "Alien", emoji: "👽", description: "Green alien makeover" },
-  { id: "mirror", label: "Mirror", emoji: "🪞", description: "Mirrored face split" },
+  { id: "bigEyes",   label: "Big Eyes",  emoji: "👀", description: "Enormous googly eyes on real landmarks" },
+  { id: "squish",    label: "Squish",    emoji: "🥞", description: "Squash your face flat" },
+  { id: "stretch",   label: "Stretch",   emoji: "🦒", description: "Stretch your face tall" },
+  { id: "wobble",    label: "Wobble",    emoji: "🌊", description: "Wavy liquid distortion" },
+  { id: "pixelate",  label: "Pixelate",  emoji: "👾", description: "8-bit pixel face" },
+  { id: "rainbow",   label: "Rainbow",   emoji: "🌈", description: "Animated rainbow overlay" },
+  { id: "alien",     label: "Alien",     emoji: "👽", description: "Green alien with real eye positions" },
+  { id: "mirror",    label: "Mirror",    emoji: "🪞", description: "Mirrored face split" },
 ];
 
-// Minimal face-landmark simulation using colour analysis + canvas
-// We use the browser's native FaceDetector API where available,
-// falling back to a centre-of-frame heuristic.
+// MediaPipe landmark indices
+const LM = {
+  // Eyes
+  LEFT_EYE_CENTER: 468,   // with iris
+  RIGHT_EYE_CENTER: 473,
+  LEFT_EYE_LEFT: 33,
+  LEFT_EYE_RIGHT: 133,
+  RIGHT_EYE_LEFT: 362,
+  RIGHT_EYE_RIGHT: 263,
+  // Nose
+  NOSE_TIP: 4,
+  // Mouth
+  MOUTH_LEFT: 61,
+  MOUTH_RIGHT: 291,
+  MOUTH_TOP: 13,
+  MOUTH_BOTTOM: 14,
+  // Face outline
+  CHIN: 152,
+  FOREHEAD: 10,
+  FACE_LEFT: 234,
+  FACE_RIGHT: 454,
+};
 
-declare global {
-  interface Window {
-    FaceDetector?: new (options?: { maxDetectedFaces?: number; fastMode?: boolean }) => {
-      detect: (source: HTMLVideoElement) => Promise<Array<{ boundingBox: DOMRectReadOnly }>>;
+interface Landmark { x: number; y: number; z: number; }
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let faceLandmarker: any = null;
+let mediaPipeReady = false;
+
+async function loadMediaPipe(): Promise<boolean> {
+  if (mediaPipeReady) return true;
+  return new Promise((resolve) => {
+    // Load the MediaPipe vision bundle from CDN
+    const script = document.createElement("script");
+    script.src = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.js";
+    script.onload = async () => {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const vision = (window as any);
+        const { FaceLandmarker, FilesetResolver } = vision;
+
+        const filesetResolver = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+        );
+
+        faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
+          baseOptions: {
+            modelAssetPath:
+              "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+            delegate: "GPU",
+          },
+          outputFaceBlendshapes: false,
+          runningMode: "VIDEO",
+          numFaces: 4,
+        });
+
+        mediaPipeReady = true;
+        resolve(true);
+      } catch (e) {
+        console.error("MediaPipe init failed", e);
+        resolve(false);
+      }
     };
-  }
-}
-
-interface FaceBox {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
+    script.onerror = () => resolve(false);
+    document.head.appendChild(script);
+  });
 }
 
 export default function App() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animRef = useRef<number>(0);
-  const detectorRef = useRef<InstanceType<NonNullable<typeof window.FaceDetector>> | null>(null);
-  const facesRef = useRef<FaceBox[]>([]);
-  const timeRef = useRef(0);
+  const lastVideoTimeRef = useRef(-1);
+  const landmarksRef = useRef<Landmark[][]>([]);
 
   const [activeEffect, setActiveEffect] = useState<FunnyEffect>("bigEyes");
   const [cameraActive, setCameraActive] = useState(false);
+  const [modelStatus, setModelStatus] = useState<"idle" | "loading" | "ready" | "failed">("idle");
   const [error, setError] = useState<string | null>(null);
-  const [hasFaceAPI, setHasFaceAPI] = useState(false);
   const [faceCount, setFaceCount] = useState(0);
+
+  // ── Load MediaPipe on mount ───────────────────────────────────────────────
+  useEffect(() => {
+    setModelStatus("loading");
+    loadMediaPipe().then((ok) => setModelStatus(ok ? "ready" : "failed"));
+  }, []);
 
   // ── Start camera ──────────────────────────────────────────────────────────
   const startCamera = useCallback(async () => {
@@ -87,72 +149,15 @@ export default function App() {
     }
     setCameraActive(false);
     cancelAnimationFrame(animRef.current);
+    landmarksRef.current = [];
+    setFaceCount(0);
   }, []);
 
-  // ── Init FaceDetector API ─────────────────────────────────────────────────
-  useEffect(() => {
-    if (window.FaceDetector) {
-      try {
-        detectorRef.current = new window.FaceDetector({ maxDetectedFaces: 4, fastMode: true });
-        setHasFaceAPI(true);
-      } catch {
-        setHasFaceAPI(false);
-      }
-    }
-  }, []);
-
-  // ── Face detection loop (runs every ~200ms) ───────────────────────────────
-  useEffect(() => {
-    if (!cameraActive) return;
-    let running = true;
-
-    const detectLoop = async () => {
-      while (running) {
-        if (videoRef.current && videoRef.current.readyState >= 2) {
-          if (detectorRef.current) {
-            try {
-              const results = await detectorRef.current.detect(videoRef.current);
-              facesRef.current = results.map((r) => ({
-                x: r.boundingBox.x,
-                y: r.boundingBox.y,
-                width: r.boundingBox.width,
-                height: r.boundingBox.height,
-              }));
-              setFaceCount(results.length);
-            } catch {
-              // fallback below
-            }
-          } else {
-            // Heuristic: assume face in centre-ish area
-            const vw = videoRef.current.videoWidth;
-            const vh = videoRef.current.videoHeight;
-            if (vw > 0) {
-              facesRef.current = [
-                {
-                  x: vw * 0.2,
-                  y: vh * 0.1,
-                  width: vw * 0.6,
-                  height: vh * 0.7,
-                },
-              ];
-              setFaceCount(1);
-            }
-          }
-        }
-        await new Promise((r) => setTimeout(r, 200));
-      }
-    };
-
-    detectLoop();
-    return () => { running = false; };
-  }, [cameraActive]);
-
-  // ── Render loop ───────────────────────────────────────────────────────────
+  // ── Render + detection loop ───────────────────────────────────────────────
   useEffect(() => {
     if (!cameraActive) return;
 
     const render = (timestamp: number) => {
-      timeRef.current = timestamp;
       const video = videoRef.current;
       const canvas = canvasRef.current;
       if (!video || !canvas || video.readyState < 2) {
@@ -162,34 +167,45 @@ export default function App() {
 
       const vw = video.videoWidth;
       const vh = video.videoHeight;
-      if (vw === 0) {
-        animRef.current = requestAnimationFrame(render);
-        return;
-      }
+      if (vw === 0) { animRef.current = requestAnimationFrame(render); return; }
 
       canvas.width = vw;
       canvas.height = vh;
       const ctx = canvas.getContext("2d")!;
 
-      // Draw base video frame (mirrored for selfie feel)
+      // Draw mirrored video frame
       ctx.save();
       ctx.scale(-1, 1);
       ctx.drawImage(video, -vw, 0, vw, vh);
       ctx.restore();
 
-      const faces = facesRef.current;
-      const t = timestamp / 1000;
+      // Run MediaPipe detection (once per new video frame)
+      if (faceLandmarker && video.currentTime !== lastVideoTimeRef.current) {
+        lastVideoTimeRef.current = video.currentTime;
+        try {
+          const results = faceLandmarker.detectForVideo(video, timestamp);
+          if (results?.faceLandmarks) {
+            landmarksRef.current = results.faceLandmarks;
+            setFaceCount(results.faceLandmarks.length);
+          }
+        } catch {
+          // silently continue
+        }
+      }
 
-      faces.forEach((rawFace) => {
-        // Mirror the face box X since we flipped the canvas
-        const face: FaceBox = {
-          x: vw - rawFace.x - rawFace.width,
-          y: rawFace.y,
-          width: rawFace.width,
-          height: rawFace.height,
-        };
-        applyEffect(ctx, canvas, face, activeEffect, t, vw, vh);
+      const t = timestamp / 1000;
+      const faces = landmarksRef.current;
+
+      faces.forEach((landmarks) => {
+        // Mirror landmark X coords to match flipped canvas
+        const mirroredLandmarks = landmarks.map((lm) => ({ ...lm, x: 1 - lm.x }));
+        applyEffect(ctx, canvas, mirroredLandmarks, activeEffect, t, vw, vh);
       });
+
+      // If no MediaPipe yet, fall back to heuristic
+      if (!faceLandmarker && faces.length === 0) {
+        applyEffectHeuristic(ctx, canvas, activeEffect, t, vw, vh);
+      }
 
       animRef.current = requestAnimationFrame(render);
     };
@@ -198,43 +214,35 @@ export default function App() {
     return () => cancelAnimationFrame(animRef.current);
   }, [cameraActive, activeEffect]);
 
-  // ── Cleanup ───────────────────────────────────────────────────────────────
   useEffect(() => () => stopCamera(), [stopCamera]);
+
+  const statusColor =
+    modelStatus === "ready" ? "var(--success)" :
+    modelStatus === "loading" ? "var(--warning)" :
+    modelStatus === "failed" ? "var(--error)" : "var(--muted)";
+
+  const statusText =
+    modelStatus === "ready" ? "✓ MediaPipe 478-point landmarks active" :
+    modelStatus === "loading" ? "⏳ Loading face landmark model…" :
+    modelStatus === "failed" ? "⚠ Model failed — using heuristic fallback" : "";
 
   return (
     <Shell>
       <div className="max-w-3xl mx-auto flex flex-col gap-6">
         {/* Header */}
         <div>
-          <h1
-            className="text-3xl font-bold mb-1"
-            style={{ fontFamily: "Fraunces, serif", color: "var(--ink)" }}
-          >
+          <h1 className="text-3xl font-bold mb-1" style={{ fontFamily: "Fraunces, serif", color: "var(--ink)" }}>
             😂 Face Morpher
           </h1>
-          <p style={{ color: "var(--muted)" }}>
-            Real-time funny face effects using your camera.{" "}
-            {hasFaceAPI ? (
-              <span style={{ color: "var(--success)" }}>✓ Native face detection active</span>
-            ) : (
-              <span style={{ color: "var(--warning)" }}>⚠ Using centre-frame heuristic</span>
-            )}
-          </p>
+          <p className="text-sm" style={{ color: statusColor }}>{statusText}</p>
         </div>
 
         {/* Camera view */}
         <div
           className="relative rounded-2xl overflow-hidden"
-          style={{
-            background: "var(--panel)",
-            border: "1px solid var(--line)",
-            aspectRatio: "4/3",
-          }}
+          style={{ background: "#111", border: "1px solid var(--line)", aspectRatio: "4/3" }}
         >
-          {/* Hidden video source */}
           <video ref={videoRef} className="hidden" playsInline muted />
-
-          {/* Output canvas */}
           <canvas
             ref={canvasRef}
             className="w-full h-full object-contain"
@@ -245,26 +253,25 @@ export default function App() {
           {!cameraActive && (
             <div className="absolute inset-0 flex flex-col items-center justify-center gap-4">
               <div className="text-6xl">🎭</div>
-              <p className="text-lg font-semibold" style={{ color: "var(--ink)" }}>
-                Ready to get funny?
-              </p>
-              <p className="text-sm text-center px-8" style={{ color: "var(--muted)" }}>
-                Click below to start your camera and apply real-time face effects.
+              <p className="text-lg font-semibold" style={{ color: "#fff" }}>Ready to get funny?</p>
+              <p className="text-sm text-center px-8" style={{ color: "#aaa" }}>
+                {modelStatus === "loading"
+                  ? "Loading the face landmark model first…"
+                  : "Click below to start your camera with real-time face morphing."}
               </p>
               {error && (
-                <p
-                  className="text-sm text-center px-6 py-2 rounded-xl"
-                  style={{ color: "var(--error)", background: "rgba(220,38,38,0.08)" }}
-                >
+                <p className="text-sm text-center px-6 py-2 rounded-xl"
+                  style={{ color: "var(--error)", background: "rgba(220,38,38,0.12)" }}>
                   {error}
                 </p>
               )}
               <button
                 onClick={startCamera}
-                className="px-6 py-3 rounded-xl font-semibold text-white transition-opacity hover:opacity-90"
+                disabled={modelStatus === "loading"}
+                className="px-6 py-3 rounded-xl font-semibold text-white transition-opacity hover:opacity-90 disabled:opacity-50"
                 style={{ background: "var(--accent)" }}
               >
-                Start Camera
+                {modelStatus === "loading" ? "Loading model…" : "Start Camera"}
               </button>
             </div>
           )}
@@ -272,7 +279,7 @@ export default function App() {
           {/* Live badge */}
           {cameraActive && (
             <div className="absolute top-3 left-3 flex items-center gap-2 px-3 py-1 rounded-full text-xs font-bold text-white"
-              style={{ background: "rgba(0,0,0,0.55)" }}>
+              style={{ background: "rgba(0,0,0,0.6)" }}>
               <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse inline-block" />
               LIVE · {faceCount} face{faceCount !== 1 ? "s" : ""}
             </div>
@@ -283,7 +290,7 @@ export default function App() {
             <button
               onClick={stopCamera}
               className="absolute top-3 right-3 px-3 py-1 rounded-full text-xs font-bold text-white transition-opacity hover:opacity-80"
-              style={{ background: "rgba(0,0,0,0.55)" }}
+              style={{ background: "rgba(0,0,0,0.6)" }}
             >
               ✕ Stop
             </button>
@@ -300,7 +307,7 @@ export default function App() {
               <button
                 key={effect.id}
                 onClick={() => setActiveEffect(effect.id)}
-                className="flex flex-col items-center gap-1 p-3 rounded-xl border transition-all hover:scale-105"
+                className="flex flex-col items-center gap-1 p-3 rounded-xl border transition-all hover:scale-105 active:scale-95"
                 style={{
                   borderColor: activeEffect === effect.id ? "var(--accent)" : "var(--line)",
                   background: activeEffect === effect.id ? "rgba(37,99,235,0.08)" : "var(--panel)",
@@ -308,9 +315,7 @@ export default function App() {
                 }}
               >
                 <span className="text-2xl">{effect.emoji}</span>
-                <span className="text-xs font-bold" style={{ color: "var(--ink)" }}>
-                  {effect.label}
-                </span>
+                <span className="text-xs font-bold" style={{ color: "var(--ink)" }}>{effect.label}</span>
                 <span className="text-xs text-center leading-tight" style={{ color: "var(--muted)" }}>
                   {effect.description}
                 </span>
@@ -319,13 +324,10 @@ export default function App() {
           </div>
         </div>
 
-        {/* Tips */}
-        <div
-          className="rounded-xl p-4 text-sm"
-          style={{ background: "var(--panel)", border: "1px solid var(--line)", color: "var(--muted)" }}
-        >
-          💡 <strong style={{ color: "var(--ink)" }}>Tips:</strong> Face the camera straight-on for best results.
-          Good lighting helps detection. Switch effects anytime — changes apply instantly!
+        {/* Info */}
+        <div className="rounded-xl p-4 text-sm" style={{ background: "var(--panel)", border: "1px solid var(--line)", color: "var(--muted)" }}>
+          🧠 <strong style={{ color: "var(--ink)" }}>On-device AI:</strong> Uses MediaPipe Face Landmarker with 478 facial landmarks.
+          Everything runs in your browser — no video is ever sent anywhere.
         </div>
       </div>
     </Shell>
@@ -333,66 +335,92 @@ export default function App() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Effect rendering functions
+// Helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
+function lm(landmarks: Landmark[], idx: number, vw: number, vh: number): [number, number] {
+  const p = landmarks[idx] ?? { x: 0.5, y: 0.5 };
+  return [p.x * vw, p.y * vh];
+}
+
+function eyeRadius(landmarks: Landmark[], leftIdx: number, rightIdx: number, vw: number): number {
+  const [lx] = lm(landmarks, leftIdx, vw, 1);
+  const [rx] = lm(landmarks, rightIdx, vw, 1);
+  return Math.abs(rx - lx) * 0.9;
+}
+
+// ── Dispatch ──────────────────────────────────────────────────────────────
 function applyEffect(
   ctx: CanvasRenderingContext2D,
   canvas: HTMLCanvasElement,
-  face: FaceBox,
+  landmarks: Landmark[],
   effect: FunnyEffect,
   t: number,
   vw: number,
   vh: number
 ) {
-  const { x, y, width: fw, height: fh } = face;
-  const cx = x + fw / 2;
-  const cy = y + fh / 2;
-
   switch (effect) {
-    case "bigEyes":
-      drawBigEyes(ctx, face, t);
-      break;
-    case "squish":
-      distortFaceRegion(ctx, canvas, face, 1.6, 0.5, cx, cy);
-      break;
-    case "stretch":
-      distortFaceRegion(ctx, canvas, face, 0.6, 1.7, cx, cy);
-      break;
-    case "wobble":
-      applyWobble(ctx, canvas, face, t);
-      break;
-    case "pixelate":
-      applyPixelate(ctx, face);
-      break;
-    case "rainbow":
-      applyRainbow(ctx, face, t);
-      break;
-    case "alien":
-      applyAlien(ctx, face, t);
-      break;
-    case "mirror":
-      applyMirror(ctx, canvas, face, vw);
-      break;
+    case "bigEyes":   drawBigEyes(ctx, landmarks, t, vw, vh); break;
+    case "squish":    distortFace(ctx, canvas, landmarks, 1.6, 0.5, vw, vh); break;
+    case "stretch":   distortFace(ctx, canvas, landmarks, 0.6, 1.7, vw, vh); break;
+    case "wobble":    applyWobble(ctx, canvas, landmarks, t, vw, vh); break;
+    case "pixelate":  applyPixelate(ctx, landmarks, vw, vh); break;
+    case "rainbow":   applyRainbow(ctx, landmarks, t, vw, vh); break;
+    case "alien":     applyAlien(ctx, landmarks, t, vw, vh); break;
+    case "mirror":    applyMirror(ctx, canvas, landmarks, vw, vh); break;
   }
 }
 
+// Heuristic fallback (no landmarks)
+function applyEffectHeuristic(
+  ctx: CanvasRenderingContext2D,
+  canvas: HTMLCanvasElement,
+  effect: FunnyEffect,
+  t: number,
+  vw: number,
+  vh: number
+) {
+  // Synthesise fake landmarks centred in frame
+  const fake: Landmark[] = Array.from({ length: 478 }, (_, i) => {
+    const col = i % 22;
+    const row = Math.floor(i / 22);
+    return { x: 0.2 + (col / 21) * 0.6, y: 0.1 + (row / 21) * 0.7, z: 0 };
+  });
+  // key points
+  fake[LM.LEFT_EYE_CENTER]  = { x: 0.35, y: 0.38, z: 0 };
+  fake[LM.RIGHT_EYE_CENTER] = { x: 0.65, y: 0.38, z: 0 };
+  fake[LM.LEFT_EYE_LEFT]    = { x: 0.25, y: 0.38, z: 0 };
+  fake[LM.LEFT_EYE_RIGHT]   = { x: 0.42, y: 0.38, z: 0 };
+  fake[LM.RIGHT_EYE_LEFT]   = { x: 0.58, y: 0.38, z: 0 };
+  fake[LM.RIGHT_EYE_RIGHT]  = { x: 0.75, y: 0.38, z: 0 };
+  fake[LM.NOSE_TIP]         = { x: 0.5,  y: 0.52, z: 0 };
+  fake[LM.MOUTH_LEFT]       = { x: 0.38, y: 0.65, z: 0 };
+  fake[LM.MOUTH_RIGHT]      = { x: 0.62, y: 0.65, z: 0 };
+  fake[LM.MOUTH_TOP]        = { x: 0.5,  y: 0.62, z: 0 };
+  fake[LM.MOUTH_BOTTOM]     = { x: 0.5,  y: 0.70, z: 0 };
+  fake[LM.CHIN]             = { x: 0.5,  y: 0.80, z: 0 };
+  fake[LM.FOREHEAD]         = { x: 0.5,  y: 0.15, z: 0 };
+  fake[LM.FACE_LEFT]        = { x: 0.18, y: 0.50, z: 0 };
+  fake[LM.FACE_RIGHT]       = { x: 0.82, y: 0.50, z: 0 };
+
+  applyEffect(ctx, canvas, fake, effect, t, vw, vh);
+}
+
 // ── Big Eyes ──────────────────────────────────────────────────────────────
-function drawBigEyes(ctx: CanvasRenderingContext2D, face: FaceBox, t: number) {
-  const { x, y, width: fw, height: fh } = face;
-  const eyeY = y + fh * 0.38;
-  const eyeR = fw * 0.22 + Math.sin(t * 3) * fw * 0.02;
+function drawBigEyes(ctx: CanvasRenderingContext2D, landmarks: Landmark[], t: number, vw: number, vh: number) {
+  const [lx, ly] = lm(landmarks, LM.LEFT_EYE_CENTER,  vw, vh);
+  const [rx, ry] = lm(landmarks, LM.RIGHT_EYE_CENTER, vw, vh);
+  const lR = eyeRadius(landmarks, LM.LEFT_EYE_LEFT,  LM.LEFT_EYE_RIGHT,  vw) * 1.8;
+  const rR = eyeRadius(landmarks, LM.RIGHT_EYE_LEFT, LM.RIGHT_EYE_RIGHT, vw) * 1.8;
 
-  // Left eye
-  const lx = x + fw * 0.3;
-  // Right eye
-  const rx = x + fw * 0.7;
+  [[lx, ly, lR, "#3b82f6"], [rx, ry, rR, "#10b981"]].forEach(([ex, ey, er, col], i) => {
+    const eyeX = ex as number, eyeY = ey as number, eyeR = er as number;
+    const pupilOffset = Math.sin(t * 1.5 + i) * eyeR * 0.15;
 
-  [lx, rx].forEach((ex, i) => {
-    // White sclera
+    // Sclera
     ctx.save();
     ctx.beginPath();
-    ctx.ellipse(ex, eyeY, eyeR, eyeR * 0.85, 0, 0, Math.PI * 2);
+    ctx.ellipse(eyeX, eyeY, eyeR, eyeR * 0.88, 0, 0, Math.PI * 2);
     ctx.fillStyle = "white";
     ctx.fill();
     ctx.strokeStyle = "#222";
@@ -401,19 +429,18 @@ function drawBigEyes(ctx: CanvasRenderingContext2D, face: FaceBox, t: number) {
     ctx.restore();
 
     // Iris
-    const irisR = eyeR * 0.6;
-    const pupilOffset = Math.sin(t * 1.5 + i) * eyeR * 0.15;
+    const irisR = eyeR * 0.58;
     ctx.save();
     ctx.beginPath();
-    ctx.ellipse(ex + pupilOffset, eyeY + pupilOffset * 0.5, irisR, irisR, 0, 0, Math.PI * 2);
-    ctx.fillStyle = i === 0 ? "#3b82f6" : "#10b981";
+    ctx.ellipse(eyeX + pupilOffset, eyeY + pupilOffset * 0.5, irisR, irisR, 0, 0, Math.PI * 2);
+    ctx.fillStyle = col as string;
     ctx.fill();
     ctx.restore();
 
     // Pupil
     ctx.save();
     ctx.beginPath();
-    ctx.ellipse(ex + pupilOffset, eyeY + pupilOffset * 0.5, irisR * 0.45, irisR * 0.45, 0, 0, Math.PI * 2);
+    ctx.ellipse(eyeX + pupilOffset, eyeY + pupilOffset * 0.5, irisR * 0.44, irisR * 0.44, 0, 0, Math.PI * 2);
     ctx.fillStyle = "#111";
     ctx.fill();
     ctx.restore();
@@ -421,43 +448,49 @@ function drawBigEyes(ctx: CanvasRenderingContext2D, face: FaceBox, t: number) {
     // Highlight
     ctx.save();
     ctx.beginPath();
-    ctx.ellipse(ex + pupilOffset - irisR * 0.2, eyeY + pupilOffset * 0.5 - irisR * 0.2, irisR * 0.15, irisR * 0.15, 0, 0, Math.PI * 2);
-    ctx.fillStyle = "rgba(255,255,255,0.9)";
+    ctx.ellipse(eyeX + pupilOffset - irisR * 0.22, eyeY + pupilOffset * 0.5 - irisR * 0.22, irisR * 0.16, irisR * 0.16, 0, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(255,255,255,0.92)";
     ctx.fill();
     ctx.restore();
   });
 }
 
-// ── Distort (squish / stretch) ────────────────────────────────────────────
-function distortFaceRegion(
+// ── Face bounding box from landmarks ─────────────────────────────────────
+function faceBBox(landmarks: Landmark[], vw: number, vh: number) {
+  const xs = landmarks.map((l) => l.x * vw);
+  const ys = landmarks.map((l) => l.y * vh);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+}
+
+// ── Squish / Stretch ──────────────────────────────────────────────────────
+function distortFace(
   ctx: CanvasRenderingContext2D,
   canvas: HTMLCanvasElement,
-  face: FaceBox,
+  landmarks: Landmark[],
   scaleX: number,
   scaleY: number,
-  cx: number,
-  cy: number
+  vw: number,
+  vh: number
 ) {
+  const bb = faceBBox(landmarks, vw, vh);
   const pad = 0.15;
-  const sx = Math.max(0, face.x - face.width * pad);
-  const sy = Math.max(0, face.y - face.height * pad);
-  const sw = Math.min(canvas.width - sx, face.width * (1 + pad * 2));
-  const sh = Math.min(canvas.height - sy, face.height * (1 + pad * 2));
+  const sx = Math.max(0, bb.x - bb.width * pad);
+  const sy = Math.max(0, bb.y - bb.height * pad);
+  const sw = Math.min(canvas.width - sx, bb.width * (1 + pad * 2));
+  const sh = Math.min(canvas.height - sy, bb.height * (1 + pad * 2));
+  const cx = sx + sw / 2;
+  const cy = sy + sh / 2;
 
-  // Grab the region
-  const offscreen = document.createElement("canvas");
-  offscreen.width = sw;
-  offscreen.height = sh;
-  const offCtx = offscreen.getContext("2d")!;
-  offCtx.drawImage(canvas, sx, sy, sw, sh, 0, 0, sw, sh);
+  const off = document.createElement("canvas");
+  off.width = sw; off.height = sh;
+  off.getContext("2d")!.drawImage(canvas, sx, sy, sw, sh, 0, 0, sw, sh);
 
-  // Clear region and redraw scaled
   ctx.save();
-  ctx.clearRect(sx, sy, sw, sh);
-  // Redraw background first (just fill with black to mask)
   ctx.translate(cx, cy);
   ctx.scale(scaleX, scaleY);
-  ctx.drawImage(offscreen, -sw / 2, -sh / 2, sw, sh);
+  ctx.drawImage(off, -sw / 2, -sh / 2, sw, sh);
   ctx.restore();
 }
 
@@ -465,67 +498,61 @@ function distortFaceRegion(
 function applyWobble(
   ctx: CanvasRenderingContext2D,
   canvas: HTMLCanvasElement,
-  face: FaceBox,
-  t: number
+  landmarks: Landmark[],
+  t: number,
+  vw: number,
+  vh: number
 ) {
-  const { x, y, width: fw, height: fh } = face;
+  const bb = faceBBox(landmarks, vw, vh);
   const pad = 0.2;
-  const sx = Math.max(0, x - fw * pad);
-  const sy = Math.max(0, y - fh * pad);
-  const sw = Math.min(canvas.width - sx, fw * (1 + pad * 2));
-  const sh = Math.min(canvas.height - sy, fh * (1 + pad * 2));
+  const sx = Math.max(0, Math.floor(bb.x - bb.width * pad));
+  const sy = Math.max(0, Math.floor(bb.y - bb.height * pad));
+  const sw = Math.min(canvas.width - sx, Math.floor(bb.width * (1 + pad * 2)));
+  const sh = Math.min(canvas.height - sy, Math.floor(bb.height * (1 + pad * 2)));
 
-  const offscreen = document.createElement("canvas");
-  offscreen.width = sw;
-  offscreen.height = sh;
-  const offCtx = offscreen.getContext("2d")!;
-  offCtx.drawImage(canvas, sx, sy, sw, sh, 0, 0, sw, sh);
+  const off = document.createElement("canvas");
+  off.width = sw; off.height = sh;
+  off.getContext("2d")!.drawImage(canvas, sx, sy, sw, sh, 0, 0, sw, sh);
 
-  const imgData = offCtx.getImageData(0, 0, sw, sh);
+  const imgData = off.getContext("2d")!.getImageData(0, 0, sw, sh);
   const src = new Uint8ClampedArray(imgData.data);
   const dst = imgData.data;
-  const amp = fw * 0.06;
-  const freq = 4;
+  const amp = bb.width * 0.06;
 
   for (let py = 0; py < sh; py++) {
     for (let px = 0; px < sw; px++) {
-      const ox = Math.round(amp * Math.sin((py / sh) * Math.PI * freq + t * 5));
-      const oy = Math.round(amp * 0.5 * Math.sin((px / sw) * Math.PI * freq + t * 4));
+      const ox = Math.round(amp * Math.sin((py / sh) * Math.PI * 4 + t * 5));
+      const oy = Math.round(amp * 0.5 * Math.sin((px / sw) * Math.PI * 4 + t * 4));
       const spx = Math.min(sw - 1, Math.max(0, px + ox));
       const spy = Math.min(sh - 1, Math.max(0, py + oy));
       const di = (py * sw + px) * 4;
       const si = (spy * sw + spx) * 4;
-      dst[di] = src[si];
-      dst[di + 1] = src[si + 1];
-      dst[di + 2] = src[si + 2];
-      dst[di + 3] = src[si + 3];
+      dst[di] = src[si]; dst[di + 1] = src[si + 1];
+      dst[di + 2] = src[si + 2]; dst[di + 3] = src[si + 3];
     }
   }
-  offCtx.putImageData(imgData, 0, 0);
-  ctx.drawImage(offscreen, sx, sy, sw, sh);
+  off.getContext("2d")!.putImageData(imgData, 0, 0);
+  ctx.drawImage(off, sx, sy, sw, sh);
 }
 
 // ── Pixelate ──────────────────────────────────────────────────────────────
-function applyPixelate(ctx: CanvasRenderingContext2D, face: FaceBox) {
-  const { x, y, width: fw, height: fh } = face;
-  const blockSize = Math.max(8, Math.round(fw / 12));
-  const sx = Math.max(0, Math.floor(x));
-  const sy = Math.max(0, Math.floor(y));
-  const sw = Math.floor(fw);
-  const sh = Math.floor(fh);
+function applyPixelate(ctx: CanvasRenderingContext2D, landmarks: Landmark[], vw: number, vh: number) {
+  const bb = faceBBox(landmarks, vw, vh);
+  const blockSize = Math.max(8, Math.round(bb.width / 14));
+  const sx = Math.max(0, Math.floor(bb.x));
+  const sy = Math.max(0, Math.floor(bb.y));
+  const sw = Math.min(canvas_w(ctx), Math.floor(bb.width));
+  const sh = Math.min(canvas_h(ctx), Math.floor(bb.height));
 
   const imgData = ctx.getImageData(sx, sy, sw, sh);
   const d = imgData.data;
 
   for (let by = 0; by < sh; by += blockSize) {
     for (let bx = 0; bx < sw; bx += blockSize) {
-      // Sample centre pixel
       const cpx = Math.min(sw - 1, bx + Math.floor(blockSize / 2));
       const cpy = Math.min(sh - 1, by + Math.floor(blockSize / 2));
       const ci = (cpy * sw + cpx) * 4;
       const r = d[ci], g = d[ci + 1], b = d[ci + 2];
-
-      // Fill block
       for (let dy = 0; dy < blockSize && by + dy < sh; dy++) {
         for (let dx = 0; dx < blockSize && bx + dx < sw; dx++) {
           const i = ((by + dy) * sw + (bx + dx)) * 4;
@@ -537,16 +564,22 @@ function applyPixelate(ctx: CanvasRenderingContext2D, face: FaceBox) {
   ctx.putImageData(imgData, sx, sy);
 }
 
+function canvas_w(ctx: CanvasRenderingContext2D) { return ctx.canvas.width; }
+function canvas_h(ctx: CanvasRenderingContext2D) { return ctx.canvas.height; }
+
 // ── Rainbow ───────────────────────────────────────────────────────────────
-function applyRainbow(ctx: CanvasRenderingContext2D, face: FaceBox, t: number) {
-  const { x, y, width: fw, height: fh } = face;
-  const grad = ctx.createLinearGradient(x, y, x + fw, y + fh);
+function applyRainbow(ctx: CanvasRenderingContext2D, landmarks: Landmark[], t: number, vw: number, vh: number) {
+  const bb = faceBBox(landmarks, vw, vh);
+  const { x, y, width: fw, height: fh } = bb;
   const hue = (t * 60) % 360;
-  grad.addColorStop(0, `hsla(${hue}, 100%, 50%, 0.35)`);
-  grad.addColorStop(0.25, `hsla(${(hue + 60) % 360}, 100%, 50%, 0.35)`);
-  grad.addColorStop(0.5, `hsla(${(hue + 120) % 360}, 100%, 50%, 0.35)`);
-  grad.addColorStop(0.75, `hsla(${(hue + 240) % 360}, 100%, 50%, 0.35)`);
-  grad.addColorStop(1, `hsla(${(hue + 300) % 360}, 100%, 50%, 0.35)`);
+
+  const grad = ctx.createLinearGradient(x, y, x + fw, y + fh);
+  grad.addColorStop(0,    `hsla(${hue},           100%, 50%, 0.38)`);
+  grad.addColorStop(0.25, `hsla(${(hue+60)%360},  100%, 50%, 0.38)`);
+  grad.addColorStop(0.5,  `hsla(${(hue+120)%360}, 100%, 50%, 0.38)`);
+  grad.addColorStop(0.75, `hsla(${(hue+240)%360}, 100%, 50%, 0.38)`);
+  grad.addColorStop(1,    `hsla(${(hue+300)%360}, 100%, 50%, 0.38)`);
+
   ctx.save();
   ctx.fillStyle = grad;
   ctx.beginPath();
@@ -554,63 +587,64 @@ function applyRainbow(ctx: CanvasRenderingContext2D, face: FaceBox, t: number) {
   ctx.fill();
   ctx.restore();
 
-  // Stars / sparkles
+  // Orbiting sparkles
   for (let i = 0; i < 6; i++) {
     const angle = (i / 6) * Math.PI * 2 + t * 2;
     const r = fw * 0.55;
-    const sx2 = x + fw / 2 + Math.cos(angle) * r;
+    const sx = x + fw / 2 + Math.cos(angle) * r;
     const sy2 = y + fh / 2 + Math.sin(angle) * r;
     ctx.save();
-    ctx.font = `${fw * 0.1}px serif`;
-    ctx.fillText("✨", sx2 - fw * 0.05, sy2 + fw * 0.04);
+    ctx.font = `${Math.max(12, fw * 0.1)}px serif`;
+    ctx.fillText("✨", sx - fw * 0.05, sy2 + fw * 0.04);
     ctx.restore();
   }
 }
 
 // ── Alien ─────────────────────────────────────────────────────────────────
-function applyAlien(ctx: CanvasRenderingContext2D, face: FaceBox, t: number) {
-  const { x, y, width: fw, height: fh } = face;
+function applyAlien(ctx: CanvasRenderingContext2D, landmarks: Landmark[], t: number, vw: number, vh: number) {
+  const bb = faceBBox(landmarks, vw, vh);
+  const { x, y, width: fw, height: fh } = bb;
 
-  // Green tint overlay
+  // Green tint
   ctx.save();
   ctx.globalCompositeOperation = "multiply";
-  ctx.fillStyle = `rgba(0, 220, 80, 0.45)`;
+  ctx.fillStyle = "rgba(0,220,80,0.42)";
   ctx.beginPath();
   ctx.ellipse(x + fw / 2, y + fh / 2, fw / 2, fh / 2, 0, 0, Math.PI * 2);
   ctx.fill();
   ctx.restore();
 
-  // Big black alien eyes
-  const eyeY = y + fh * 0.35;
-  const eyeRx = fw * 0.2;
-  const eyeRy = fw * 0.14;
-  [[0.28, 0], [0.72, 0]].forEach(([ex]) => {
+  // Eyes at real landmark positions
+  const [lx, ly] = lm(landmarks, LM.LEFT_EYE_CENTER,  vw, vh);
+  const [rx, ry] = lm(landmarks, LM.RIGHT_EYE_CENTER, vw, vh);
+  const eyeRx = eyeRadius(landmarks, LM.LEFT_EYE_LEFT, LM.LEFT_EYE_RIGHT, vw) * 1.4;
+  const eyeRy = eyeRx * 0.65;
+
+  [[lx, ly], [rx, ry]].forEach(([ex, ey]) => {
     ctx.save();
     ctx.beginPath();
-    ctx.ellipse(x + fw * ex, eyeY, eyeRx, eyeRy, -0.3, 0, Math.PI * 2);
+    ctx.ellipse(ex, ey, eyeRx, eyeRy, -0.3, 0, Math.PI * 2);
     ctx.fillStyle = "#050505";
     ctx.fill();
-    // Glint
     ctx.beginPath();
-    ctx.ellipse(x + fw * ex - eyeRx * 0.3, eyeY - eyeRy * 0.3, eyeRx * 0.2, eyeRy * 0.2, 0, 0, Math.PI * 2);
+    ctx.ellipse(ex - eyeRx * 0.28, ey - eyeRy * 0.28, eyeRx * 0.22, eyeRy * 0.22, 0, 0, Math.PI * 2);
     ctx.fillStyle = "rgba(255,255,255,0.7)";
     ctx.fill();
     ctx.restore();
   });
 
-  // Antenna
-  const antX = x + fw / 2;
-  const antY = y - fh * 0.05;
+  // Antenna from forehead
+  const [fx, fy] = lm(landmarks, LM.FOREHEAD, vw, vh);
   const wobble = Math.sin(t * 3) * fw * 0.08;
   ctx.save();
   ctx.strokeStyle = "#00dc50";
   ctx.lineWidth = 3;
   ctx.beginPath();
-  ctx.moveTo(antX, antY);
-  ctx.quadraticCurveTo(antX + wobble, antY - fh * 0.25, antX + wobble * 1.5, antY - fh * 0.4);
+  ctx.moveTo(fx, fy);
+  ctx.quadraticCurveTo(fx + wobble, fy - fh * 0.2, fx + wobble * 1.5, fy - fh * 0.38);
   ctx.stroke();
   ctx.beginPath();
-  ctx.arc(antX + wobble * 1.5, antY - fh * 0.4, fw * 0.05, 0, Math.PI * 2);
+  ctx.arc(fx + wobble * 1.5, fy - fh * 0.38, fw * 0.05, 0, Math.PI * 2);
   ctx.fillStyle = "#00ff80";
   ctx.fill();
   ctx.restore();
@@ -620,32 +654,29 @@ function applyAlien(ctx: CanvasRenderingContext2D, face: FaceBox, t: number) {
 function applyMirror(
   ctx: CanvasRenderingContext2D,
   canvas: HTMLCanvasElement,
-  face: FaceBox,
-  _vw: number
+  landmarks: Landmark[],
+  vw: number,
+  vh: number
 ) {
-  const { x, y, width: fw, height: fh } = face;
+  const bb = faceBBox(landmarks, vw, vh);
   const pad = 0.1;
-  const sx = Math.max(0, x - fw * pad);
-  const sy = Math.max(0, y - fh * pad);
-  const sw = Math.min(canvas.width - sx, fw * (1 + pad * 2));
-  const sh = Math.min(canvas.height - sy, fh * (1 + pad * 2));
+  const sx = Math.max(0, bb.x - bb.width * pad);
+  const sy = Math.max(0, bb.y - bb.height * pad);
+  const sw = Math.min(canvas.width - sx, bb.width * (1 + pad * 2));
+  const sh = Math.min(canvas.height - sy, bb.height * (1 + pad * 2));
   const half = sw / 2;
 
-  // Grab left half
-  const offscreen = document.createElement("canvas");
-  offscreen.width = sw;
-  offscreen.height = sh;
-  const offCtx = offscreen.getContext("2d")!;
-  offCtx.drawImage(canvas, sx, sy, sw, sh, 0, 0, sw, sh);
+  const off = document.createElement("canvas");
+  off.width = sw; off.height = sh;
+  off.getContext("2d")!.drawImage(canvas, sx, sy, sw, sh, 0, 0, sw, sh);
 
-  // Draw left half mirrored onto right
   ctx.save();
   ctx.translate(sx + sw, sy);
   ctx.scale(-1, 1);
-  ctx.drawImage(offscreen, 0, 0, half, sh, 0, 0, half, sh);
+  ctx.drawImage(off, 0, 0, half, sh, 0, 0, half, sh);
   ctx.restore();
 
-  // Seam line
+  // Seam
   ctx.save();
   ctx.strokeStyle = "rgba(255,255,255,0.4)";
   ctx.lineWidth = 2;
