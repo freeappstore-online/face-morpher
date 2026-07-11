@@ -1,13 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from "react";
+import { FaceLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
 import { Shell } from "./components/Shell";
-
-// ── MediaPipe types (loaded via CDN) ──────────────────────────────────────
-declare global {
-  interface Window {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    MediaPipeFaceLandmarker: any;
-  }
-}
 
 type FunnyEffect =
   | "bigEyes"
@@ -62,46 +55,46 @@ const LM = {
 
 interface Landmark { x: number; y: number; z: number; }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let faceLandmarker: any = null;
+type FaceLandmarkerDelegate = "GPU" | "CPU";
+type FaceLandmarkerInstance = Awaited<ReturnType<typeof FaceLandmarker.createFromOptions>>;
+
+let faceLandmarker: FaceLandmarkerInstance | null = null;
 let mediaPipeReady = false;
 
 async function loadMediaPipe(): Promise<boolean> {
   if (mediaPipeReady) return true;
-  return new Promise((resolve) => {
-    // Load the MediaPipe vision bundle from CDN
-    const script = document.createElement("script");
-    script.src = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.js";
-    script.onload = async () => {
+
+  try {
+    const filesetResolver = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+    );
+
+    for (const delegate of ["GPU", "CPU"] as const) {
       try {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const vision = (window as any);
-        const { FaceLandmarker, FilesetResolver } = vision;
-
-        const filesetResolver = await FilesetResolver.forVisionTasks(
-          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
-        );
-
-        faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
-          baseOptions: {
-            modelAssetPath:
-              "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
-            delegate: "GPU",
-          },
-          outputFaceBlendshapes: false,
-          runningMode: "VIDEO",
-          numFaces: 4,
-        });
-
+        faceLandmarker = await createFaceLandmarker(filesetResolver, delegate);
         mediaPipeReady = true;
-        resolve(true);
-      } catch (e) {
-        console.error("MediaPipe init failed", e);
-        resolve(false);
+        return true;
+      } catch (error) {
+        console.warn(`MediaPipe ${delegate} delegate init failed`, error);
       }
-    };
-    script.onerror = () => resolve(false);
-    document.head.appendChild(script);
+    }
+  } catch (error) {
+    console.error("MediaPipe fileset init failed", error);
+  }
+
+  return false;
+}
+
+function createFaceLandmarker(filesetResolver: Awaited<ReturnType<typeof FilesetResolver.forVisionTasks>>, delegate: FaceLandmarkerDelegate) {
+  return FaceLandmarker.createFromOptions(filesetResolver, {
+    baseOptions: {
+      modelAssetPath:
+        "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+      delegate,
+    },
+    outputFaceBlendshapes: false,
+    runningMode: "VIDEO",
+    numFaces: 4,
   });
 }
 
