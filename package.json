@@ -1,0 +1,14 @@
+{
+  "name": "face-morpher",
+  "private": true,
+  "packageManager": "pnpm@10.30.3",
+  "engines": { "node": ">=22" },
+  "pnpm": { "onlyBuiltDependencies": ["esbuild"] },
+  "scripts": {
+    "dev": "pnpm --filter @face-morpher/web dev",
+    "build": "pnpm --filter @face-morpher/web build",
+    "preview": "pnpm --filter @face-morpher/web preview",
+    "typecheck": "pnpm --filter @face-morpher/web exec tsc -b",
+    "test": "pnpm --filter @face-morpher/web test"
+  }
+}
