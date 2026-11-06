@@ -8,7 +8,6 @@
     "dev": "pnpm --filter @face-morpher/web dev",
     "build": "pnpm --filter @face-morpher/web build",
     "preview": "pnpm --filter @face-morpher/web preview",
-    "typecheck": "pnpm --filter @face-morpher/web exec tsc -b",
-    "test": "pnpm --filter @face-morpher/web test"
+    "typecheck": "pnpm --filter @face-morpher/web exec tsc -b"
   }
 }
