@@ -1,0 +1,6 @@
+{
+  "appId": "face-morpher",
+  "applicationRoot": "web",
+  "outputPath": "web/dist",
+  "buildCommand": "pnpm build"
+}
