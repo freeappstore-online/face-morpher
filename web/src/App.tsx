@@ -70,12 +70,10 @@ function loadMediaPipe(): Promise<boolean> {
     mpCallbacks.push(resolve);
     if (mpLoading) return;
     mpLoading = true;
-    const script = document.createElement("script");
-    script.src = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.js";
-    script.onload = async () => {
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const { FaceLandmarker, FilesetResolver } = window as any;
+    // 0.10.14 ships only ES modules; there is no classic vision_bundle.js.
+    const bundle = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+    import(/* @vite-ignore */ bundle)
+      .then(async ({ FaceLandmarker, FilesetResolver }) => {
         const fs = await FilesetResolver.forVisionTasks(
           "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
         );
@@ -91,13 +89,11 @@ function loadMediaPipe(): Promise<boolean> {
         });
         mpReady = true;
         mpCallbacks.forEach((cb) => cb(true));
-      } catch (e) {
+      })
+      .catch((e) => {
         console.error("MediaPipe init error:", e);
         mpCallbacks.forEach((cb) => cb(false));
-      }
-    };
-    script.onerror = () => mpCallbacks.forEach((cb) => cb(false));
-    document.head.appendChild(script);
+      });
   });
 }
 
